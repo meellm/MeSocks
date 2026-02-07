@@ -27,9 +27,15 @@ LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 53
 UPSTREAM_DNS = '8.8.8.8'
 UPSTREAM_PORT = 53
-PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains
+PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains (override in config.local.py)
 CACHE_FILE = '/tmp/discord-voice-ips.json'
 CACHE_TTL = 300  # 5 minutes
+
+# Load local config if exists (keeps secrets out of git)
+try:
+    from config_local import PI_IP
+except ImportError:
+    pass
 
 # Discord domains to hijack
 DISCORD_DOMAINS = [

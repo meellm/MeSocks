@@ -19,6 +19,9 @@ VPN_PRIORITY=100
 NORMAL_PRIORITY=50
 PROXY_PORT=1080
 
+# Load local config if exists (keeps secrets out of git)
+[ -f "$(dirname "$0")/config_local.sh" ] && source "$(dirname "$0")/config_local.sh"
+
 echo ""
 echo "Configuration:"
 echo "  VPN WiFi:     $VPN_WIFI (priority: $VPN_PRIORITY)"

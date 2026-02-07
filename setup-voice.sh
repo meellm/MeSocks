@@ -12,7 +12,12 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PI_IP="${1:-YOUR_PI_IP}"
+
+# Load local config if exists
+[ -f "$SCRIPT_DIR/config_local.sh" ] && source "$SCRIPT_DIR/config_local.sh"
+
+# Allow override via command line arg
+PI_IP="${1:-${PI_IP:-YOUR_PI_IP}}"
 
 echo "========================================"
 echo "Discord Voice (UDP) Proxy Setup"

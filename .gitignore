@@ -24,3 +24,9 @@ Thumbs.db
 # Runtime files
 *.json
 *.pid
+
+# Local config overrides
+*.local
+.env
+config_local.py
+config_local.sh
