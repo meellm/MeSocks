@@ -30,3 +30,4 @@ Thumbs.db
 .env
 config_local.py
 config_local.sh
+services_config.py
