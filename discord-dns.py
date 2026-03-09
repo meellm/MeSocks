@@ -81,6 +81,9 @@ DISCORD_DOMAINS = [
     'discord-activities.com',
     'discordpartygames.com',
     'discordsays.com',
+    'discordsez.com',
+    'discordquests.com',
+    'discord.app',
     'dis.gd',
     'discordstatic.com',
 ]
