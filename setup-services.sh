@@ -181,6 +181,8 @@ ExecStart=/usr/local/bin/sniproxy \\
   --tls-port=443 \\
   --http-address=0.0.0.0 \\
   --http-port=80 \\
+  --dns-address=127.0.0.1 \\
+  --dns-redirect-ipv4-to=$PI_IP \\
   --forward-proxy=socks5://127.0.0.1:1080 \\
 $FORWARD_RULES
 Restart=always
