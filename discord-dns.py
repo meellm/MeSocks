@@ -15,6 +15,7 @@ import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
+import ipaddress
 import tempfile
 import time
 import json
@@ -28,21 +29,34 @@ import sys
 
 LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 53
-UPSTREAM_DNS = '8.8.8.8'
+UPSTREAM_DNS_SERVERS = ['8.8.8.8', '1.1.1.1', '8.8.4.4']  # Fallback DNS servers
 UPSTREAM_PORT = 53
-PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains (override in config.local.py)
+PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains (override in config_local.py)
 CACHE_FILE = '/tmp/discord-voice-ips.json'
 CACHE_TTL = 300  # 5 minutes
 HIJACK_TTL = 300  # TTL for hijacked responses (Pi IP doesn't change)
 FORWARD_CACHE_MAX = 4096  # Max cached non-Discord DNS responses
 FORWARD_CACHE_DEFAULT_TTL = 60  # Fallback TTL if parsing fails
 VOICE_RE_RESOLVE_INTERVAL = 60  # Re-resolve voice domains every N seconds
+QUERY_WORKERS = 32  # Max concurrent query handler threads
+RATE_LIMIT_PER_SEC = 50  # Max queries per second per source IP
+STATS_INTERVAL = 60  # Print stats every N seconds
+
+# Only accept queries from private networks (prevents open resolver abuse)
+ALLOWED_NETWORKS = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('127.0.0.0/8'),
+]
 
 # Load local config if exists (keeps secrets out of git)
 try:
     from config_local import PI_IP
 except ImportError:
     pass
+except Exception as e:
+    print(f"[DNS] Warning: config_local.py error: {e}, using defaults")
 
 # Discord domains to hijack
 DISCORD_DOMAINS = [
@@ -159,83 +173,89 @@ def build_empty_response(query: bytes) -> bytes:
 
 
 def resolve_upstream(domain: str) -> str | None:
-    """Resolve domain via upstream DNS, return IP or None"""
-    sock = None
-    try:
-        # Build query
-        transaction_id = os.urandom(2)
-        flags = b'\x01\x00'
-        qdcount = b'\x00\x01'
-        counts = b'\x00\x00\x00\x00\x00\x00'
+    """Resolve domain via upstream DNS with fallback servers, return IP or None"""
+    # Build query
+    transaction_id = os.urandom(2)
+    flags = b'\x01\x00'
+    qdcount = b'\x00\x01'
+    counts = b'\x00\x00\x00\x00\x00\x00'
 
-        qname = b''
-        for part in domain.split('.'):
-            qname += bytes([len(part)]) + part.encode()
-        qname += b'\x00'
+    qname = b''
+    for part in domain.split('.'):
+        qname += bytes([len(part)]) + part.encode()
+    qname += b'\x00'
 
-        qtype = b'\x00\x01'  # A
-        qclass = b'\x00\x01'  # IN
+    qtype = b'\x00\x01'  # A
+    qclass = b'\x00\x01'  # IN
 
-        query = transaction_id + flags + qdcount + counts + qname + qtype + qclass
+    query = transaction_id + flags + qdcount + counts + qname + qtype + qclass
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3)
-        sock.sendto(query, (UPSTREAM_DNS, UPSTREAM_PORT))
-        response, _ = sock.recvfrom(1024)
-        sock.close()
+    for dns_server in UPSTREAM_DNS_SERVERS:
         sock = None
-
-        # Parse response for A record
-        ancount = struct.unpack('>H', response[6:8])[0]
-        if ancount == 0:
-            return None
-
-        pos = 12
-        while response[pos] != 0:
-            pos += response[pos] + 1
-        pos += 5
-
-        for _ in range(ancount):
-            if response[pos] & 0xC0 == 0xC0:
-                pos += 2
-            else:
-                while response[pos] != 0:
-                    pos += response[pos] + 1
-                pos += 1
-
-            rtype = struct.unpack('>H', response[pos:pos+2])[0]
-            pos += 8
-            rdlength = struct.unpack('>H', response[pos:pos+2])[0]
-            pos += 2
-
-            if rtype == 1 and rdlength == 4:
-                return '.'.join(str(b) for b in response[pos:pos+4])
-            pos += rdlength
-
-        return None
-    except Exception as e:
-        print(f"[DNS] Upstream resolve error for {domain}: {e}")
-        return None
-    finally:
-        if sock:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            sock.sendto(query, (dns_server, UPSTREAM_PORT))
+            response, _ = sock.recvfrom(1024)
             sock.close()
+            sock = None
+
+            # Parse response for A record
+            ancount = struct.unpack('>H', response[6:8])[0]
+            if ancount == 0:
+                return None
+
+            pos = 12
+            while response[pos] != 0:
+                pos += response[pos] + 1
+            pos += 5
+
+            for _ in range(ancount):
+                if response[pos] & 0xC0 == 0xC0:
+                    pos += 2
+                else:
+                    while response[pos] != 0:
+                        pos += response[pos] + 1
+                    pos += 1
+
+                rtype = struct.unpack('>H', response[pos:pos+2])[0]
+                pos += 8
+                rdlength = struct.unpack('>H', response[pos:pos+2])[0]
+                pos += 2
+
+                if rtype == 1 and rdlength == 4:
+                    return '.'.join(str(b) for b in response[pos:pos+4])
+                pos += rdlength
+
+            return None
+        except Exception as e:
+            print(f"[DNS] Upstream {dns_server} failed for {domain}: {e}")
+            continue
+        finally:
+            if sock:
+                sock.close()
+
+    print(f"[DNS] All upstream servers failed for {domain}")
+    return None
 
 
 def forward_query(query: bytes) -> bytes | None:
-    """Forward query to upstream and return response"""
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(5)
-        sock.sendto(query, (UPSTREAM_DNS, UPSTREAM_PORT))
-        response, _ = sock.recvfrom(4096)
-        return response
-    except Exception as e:
-        print(f"[DNS] Forward error: {e}")
-        return None
-    finally:
-        if sock:
-            sock.close()
+    """Forward query to upstream DNS with fallback servers"""
+    for dns_server in UPSTREAM_DNS_SERVERS:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(5)
+            sock.sendto(query, (dns_server, UPSTREAM_PORT))
+            response, _ = sock.recvfrom(4096)
+            return response
+        except Exception as e:
+            print(f"[DNS] Forward to {dns_server} failed: {e}")
+            continue
+        finally:
+            if sock:
+                sock.close()
+    return None
 
 
 # ============================================================
@@ -373,6 +393,88 @@ class DNSCache:
 
 
 # ============================================================
+# Rate Limiter
+# ============================================================
+
+class RateLimiter:
+    """Per-IP rate limiter using sliding window counters."""
+
+    def __init__(self, max_per_sec: int = RATE_LIMIT_PER_SEC):
+        self.max_per_sec = max_per_sec
+        self.counters: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+        self._allowed_cache: dict[str, bool] = {}  # IP -> is_allowed (private network check)
+
+    def is_private(self, ip: str) -> bool:
+        """Check if IP is in ALLOWED_NETWORKS (cached per IP)."""
+        if ip in self._allowed_cache:
+            return self._allowed_cache[ip]
+        try:
+            addr = ipaddress.ip_address(ip)
+            allowed = any(addr in net for net in ALLOWED_NETWORKS)
+        except ValueError:
+            allowed = False
+        self._allowed_cache[ip] = allowed
+        return allowed
+
+    def allow(self, ip: str) -> bool:
+        """Return True if query from this IP should be processed."""
+        if not self.is_private(ip):
+            return False
+        now = time.time()
+        with self.lock:
+            timestamps = self.counters.get(ip, [])
+            # Remove entries older than 1 second
+            cutoff = now - 1.0
+            timestamps = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= self.max_per_sec:
+                self.counters[ip] = timestamps
+                return False
+            timestamps.append(now)
+            self.counters[ip] = timestamps
+        return True
+
+    def cleanup(self):
+        """Remove stale entries (call periodically)."""
+        cutoff = time.time() - 2.0
+        with self.lock:
+            stale = [ip for ip, ts in self.counters.items() if not ts or ts[-1] < cutoff]
+            for ip in stale:
+                del self.counters[ip]
+
+
+# ============================================================
+# Stats Counter
+# ============================================================
+
+class Stats:
+    """Thread-safe query statistics."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total = 0
+        self.hijacked = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.upstream_failures = 0
+        self.rate_limited = 0
+        self.blocked = 0  # non-private IPs
+
+    def inc(self, field: str, n: int = 1):
+        with self.lock:
+            setattr(self, field, getattr(self, field) + n)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                'total': self.total, 'hijacked': self.hijacked,
+                'cache_hits': self.cache_hits, 'cache_misses': self.cache_misses,
+                'upstream_failures': self.upstream_failures,
+                'rate_limited': self.rate_limited, 'blocked': self.blocked,
+            }
+
+
+# ============================================================
 # DNS Server
 # ============================================================
 
@@ -383,20 +485,22 @@ class DiscordDNS:
         self.sock.bind((LISTEN_HOST, LISTEN_PORT))
         self.cache = DNSCache(CACHE_FILE)
         self.forward_cache = ForwardCache()
+        self.rate_limiter = RateLimiter()
+        self.stats = Stats()
         self.resolver_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='dns-resolve')
+        self.query_pool = ThreadPoolExecutor(max_workers=QUERY_WORKERS, thread_name_prefix='dns-query')
 
-        # Start periodic voice re-resolution thread
-        self._re_resolve_thread = threading.Thread(
-            target=self._periodic_re_resolve, daemon=True
-        )
-        self._re_resolve_thread.start()
+        # Background threads
+        threading.Thread(target=self._periodic_re_resolve, daemon=True).start()
+        threading.Thread(target=self._periodic_stats, daemon=True).start()
 
         print(f"[DNS] Discord DNS Server")
         print(f"[DNS] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
-        print(f"[DNS] Upstream: {UPSTREAM_DNS}")
+        print(f"[DNS] Upstream: {', '.join(UPSTREAM_DNS_SERVERS)}")
         print(f"[DNS] Hijack IP: {PI_IP}")
         print(f"[DNS] Cache file: {CACHE_FILE}")
         print(f"[DNS] Hijacking {len(DISCORD_DOMAINS)} Discord domains")
+        print(f"[DNS] Rate limit: {RATE_LIMIT_PER_SEC}/sec per IP, private networks only")
     
     def is_discord_domain(self, domain: str) -> bool:
         """Check if domain should be hijacked"""
@@ -433,13 +537,43 @@ class DiscordDNS:
         """Re-resolve known voice domains periodically to detect IP rotations."""
         while True:
             time.sleep(VOICE_RE_RESOLVE_INTERVAL)
-            domains = self.cache.get_voice_domains()
-            if domains:
+            try:
+                domains = self.cache.get_voice_domains()
                 for domain in domains:
                     self._resolve_and_cache(domain, is_voice=True)
+            except Exception as e:
+                print(f"[DNS] Re-resolve error: {e}")
+
+    def _periodic_stats(self):
+        """Print stats and clean up rate limiter periodically."""
+        while True:
+            time.sleep(STATS_INTERVAL)
+            try:
+                s = self.stats.snapshot()
+                voice_domains = self.cache.get_voice_domains()
+                fwd_cache_size = len(self.forward_cache.cache)
+                print(f"[DNS] Stats: {s['total']} queries | "
+                      f"{s['hijacked']} hijacked | "
+                      f"{s['cache_hits']} cache hits / {s['cache_misses']} misses | "
+                      f"{s['rate_limited']} rate-limited | {s['blocked']} blocked | "
+                      f"fwd_cache={fwd_cache_size} | voice_domains={len(voice_domains)}")
+                self.rate_limiter.cleanup()
+            except Exception as e:
+                print(f"[DNS] Stats error: {e}")
 
     def handle_query(self, data: bytes, addr: tuple):
         """Handle incoming DNS query"""
+        self.stats.inc('total')
+        source_ip = addr[0]
+
+        # Rate limiting + private network check
+        if not self.rate_limiter.allow(source_ip):
+            if not self.rate_limiter.is_private(source_ip):
+                self.stats.inc('blocked')
+            else:
+                self.stats.inc('rate_limited')
+            return
+
         domain = parse_domain(data)
         qtype = parse_query_type(data)
 
@@ -447,6 +581,7 @@ class DiscordDNS:
             return
 
         if self.is_discord_domain(domain):
+            self.stats.inc('hijacked')
             if qtype == 1:  # A record
                 is_voice = self.is_voice_domain(domain)
 
@@ -465,12 +600,16 @@ class DiscordDNS:
             # Non-Discord: check forward cache first
             cached = self.forward_cache.get(domain, qtype, data[:2])
             if cached:
+                self.stats.inc('cache_hits')
                 self.sock.sendto(cached, addr)
             else:
+                self.stats.inc('cache_misses')
                 response = forward_query(data)
                 if response:
                     self.forward_cache.put(domain, qtype, response)
                     self.sock.sendto(response, addr)
+                else:
+                    self.stats.inc('upstream_failures')
     
     def run(self):
         """Main loop"""
@@ -478,11 +617,7 @@ class DiscordDNS:
         while True:
             try:
                 data, addr = self.sock.recvfrom(1024)
-                threading.Thread(
-                    target=self.handle_query,
-                    args=(data, addr),
-                    daemon=True
-                ).start()
+                self.query_pool.submit(self.handle_query, data, addr)
             except Exception as e:
                 print(f"[DNS] Error: {e}")
 
@@ -522,7 +657,7 @@ def main():
     print("This server:")
     print("  1. Hijacks Discord domains → returns Pi's IP")
     print("  2. Resolves real IPs → caches for UDP proxy")
-    print("  3. Forwards other queries → upstream DNS")
+    print(f"  3. Forwards other queries → {', '.join(UPSTREAM_DNS_SERVERS)}")
     print()
 
     try:
