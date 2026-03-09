@@ -19,6 +19,7 @@ Usage:
 import socket
 import select
 import threading
+import resource
 import time
 import json
 import sys
@@ -230,8 +231,15 @@ class DiscordUDPProxy:
 
 
 def main():
+    # Raise file descriptor limit for many concurrent sessions
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 4096), hard))
+    except Exception:
+        pass
+
     fixed_ip = sys.argv[1] if len(sys.argv) > 1 else None
-    
+
     print("=" * 60)
     print("Discord Voice UDP Proxy")
     print("=" * 60)
