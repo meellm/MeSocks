@@ -29,7 +29,8 @@ LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 443
 DISCORD_VOICE_PORT = 443  # Discord voice server destination port
 TRACKING_FILE = '/tmp/discord-voice-ips.json'
-SESSION_TIMEOUT = 120  # seconds
+SESSION_TIMEOUT = 90  # seconds (Discord sends keepalives every ~5s)
+IP_CHECK_INTERVAL = 10  # seconds between re-reading tracked IP
 BUFFER_SIZE = 65535
 
 
@@ -77,55 +78,93 @@ class DiscordUDPProxy:
         # Reverse lookup: discord_sock fileno -> Session
         self.sock_to_session: dict[int, Session] = {}
         
+        # Cached IP lookup to avoid reading file on every packet
+        self._cached_ip: str | None = None
+        self._cached_ip_time: float = 0
+
         print(f"[UDP Proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
         if fixed_discord_ip:
             print(f"[UDP Proxy] Fixed Discord IP: {fixed_discord_ip}")
         else:
             print(f"[UDP Proxy] Auto mode - reading from {TRACKING_FILE}")
-    
-    def get_discord_ip(self) -> str | None:
-        """Get Discord voice server IP"""
-        if self.fixed_discord_ip:
-            return self.fixed_discord_ip
-        
-        # Read from tracking file
+
+    def _read_discord_ip_from_file(self) -> str | None:
+        """Read Discord voice server IP from tracking file."""
         try:
             if os.path.exists(TRACKING_FILE):
                 with open(TRACKING_FILE, 'r') as f:
                     data = json.load(f)
-                    if '_latest_voice' in data:
-                        ip = data['_latest_voice']['ip']
-                        domain = data['_latest_voice'].get('domain', 'unknown')
-                        age = time.time() - data['_latest_voice']['timestamp']
-                        if age < 300:  # 5 min cache
-                            print(f"[UDP Proxy] Using tracked IP: {ip} ({domain}, {age:.0f}s ago)")
-                            return ip
-                        else:
-                            print(f"[UDP Proxy] Tracked IP too old: {age:.0f}s")
+                # Prefer per-domain voice IPs (most recently resolved)
+                if '_voice_domains' in data:
+                    best = None
+                    for domain, entry in data['_voice_domains'].items():
+                        age = time.time() - entry['timestamp']
+                        if age < 300 and (best is None or entry['timestamp'] > best[1]):
+                            best = (entry['ip'], entry['timestamp'], domain)
+                    if best:
+                        return best[0]
+                # Fallback to _latest_voice
+                if '_latest_voice' in data:
+                    age = time.time() - data['_latest_voice']['timestamp']
+                    if age < 300:
+                        return data['_latest_voice']['ip']
+                    else:
+                        print(f"[UDP Proxy] Tracked IP too old: {age:.0f}s")
         except Exception as e:
             print(f"[UDP Proxy] Error reading tracking file: {e}")
-        
         return None
+
+    def get_discord_ip(self) -> str | None:
+        """Get Discord voice server IP (cached to avoid file reads per packet)."""
+        if self.fixed_discord_ip:
+            return self.fixed_discord_ip
+        now = time.time()
+        if now - self._cached_ip_time > IP_CHECK_INTERVAL:
+            new_ip = self._read_discord_ip_from_file()
+            if new_ip and new_ip != self._cached_ip:
+                if self._cached_ip:
+                    print(f"[UDP Proxy] Discord IP changed: {self._cached_ip} -> {new_ip}")
+                else:
+                    print(f"[UDP Proxy] Using tracked IP: {new_ip}")
+                self._cached_ip = new_ip
+            self._cached_ip_time = now
+        return self._cached_ip
     
+    def _close_session(self, client_addr: tuple):
+        """Close and remove a session (must be called with sessions_lock held)."""
+        session = self.sessions.pop(client_addr, None)
+        if session:
+            try:
+                del self.sock_to_session[session.sock.fileno()]
+            except (KeyError, OSError):
+                pass
+            session.close()
+
     def handle_client_packet(self, data: bytes, client_addr: tuple):
         """Handle packet from client → Discord"""
         with self.sessions_lock:
             session = self.sessions.get(client_addr)
-            
+            discord_ip = self.get_discord_ip()
+
+            # Detect IP change on existing session
+            if session is not None and discord_ip and discord_ip != session.discord_addr[0]:
+                print(f"[UDP Proxy] IP rotated for {client_addr}: "
+                      f"{session.discord_addr[0]} -> {discord_ip}, recreating session")
+                self._close_session(client_addr)
+                session = None
+
             if session is None:
-                # New session
-                discord_ip = self.get_discord_ip()
                 if not discord_ip:
                     print(f"[UDP Proxy] ❌ No Discord IP known, dropping packet from {client_addr}")
                     return
-                
+
                 discord_addr = (discord_ip, DISCORD_VOICE_PORT)
                 session = Session(client_addr, discord_addr)
                 self.sessions[client_addr] = session
                 self.sock_to_session[session.sock.fileno()] = session
 
                 print(f"[UDP Proxy] ✅ New session: {client_addr[0]}:{client_addr[1]} -> {discord_ip}:{DISCORD_VOICE_PORT}")
-        
+
         # Forward to Discord
         try:
             session.sock.sendto(data, session.discord_addr)
@@ -149,11 +188,8 @@ class DiscordUDPProxy:
         with self.sessions_lock:
             expired = [addr for addr, s in self.sessions.items() if s.is_expired()]
             for addr in expired:
-                session = self.sessions.pop(addr)
-                if session.sock.fileno() in self.sock_to_session:
-                    del self.sock_to_session[session.sock.fileno()]
                 print(f"[UDP Proxy] Session expired: {addr}")
-                session.close()
+                self._close_session(addr)
     
     def run(self):
         """Main loop using select for efficiency"""

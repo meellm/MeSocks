@@ -14,6 +14,8 @@ import socket
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+import tempfile
 import time
 import json
 import os
@@ -31,6 +33,10 @@ UPSTREAM_PORT = 53
 PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains (override in config.local.py)
 CACHE_FILE = '/tmp/discord-voice-ips.json'
 CACHE_TTL = 300  # 5 minutes
+HIJACK_TTL = 300  # TTL for hijacked responses (Pi IP doesn't change)
+FORWARD_CACHE_MAX = 4096  # Max cached non-Discord DNS responses
+FORWARD_CACHE_DEFAULT_TTL = 60  # Fallback TTL if parsing fails
+VOICE_RE_RESOLVE_INTERVAL = 60  # Re-resolve voice domains every N seconds
 
 # Load local config if exists (keeps secrets out of git)
 try:
@@ -125,7 +131,7 @@ def build_response(query: bytes, ip: str) -> bytes:
     response += b'\xc0\x0c'  # Pointer to domain name in question
     response += b'\x00\x01'  # Type A
     response += b'\x00\x01'  # Class IN
-    response += struct.pack('>I', 60)  # TTL = 60 seconds
+    response += struct.pack('>I', HIJACK_TTL)  # TTL for hijacked response
     response += b'\x00\x04'  # Data length
     response += bytes(int(x) for x in ip.split('.'))  # IP address
     
@@ -233,7 +239,72 @@ def forward_query(query: bytes) -> bytes | None:
 
 
 # ============================================================
-# DNS Cache
+# Forward DNS Cache (non-Discord queries)
+# ============================================================
+
+class ForwardCache:
+    """In-memory cache for non-Discord DNS responses to avoid repeated upstream queries."""
+
+    def __init__(self, max_entries: int = FORWARD_CACHE_MAX):
+        self.max_entries = max_entries
+        self.cache: OrderedDict[tuple, tuple] = OrderedDict()  # (domain, qtype) -> (response_bytes, expiry)
+        self.lock = threading.Lock()
+
+    def _parse_ttl(self, response: bytes) -> int | None:
+        """Extract TTL from first answer record in DNS response."""
+        try:
+            ancount = struct.unpack('>H', response[6:8])[0]
+            if ancount == 0:
+                return None
+            # Skip question section
+            pos = 12
+            while response[pos] != 0:
+                pos += response[pos] + 1
+            pos += 5  # null + qtype + qclass
+            # Parse first answer name (handle pointer or labels)
+            if response[pos] & 0xC0 == 0xC0:
+                pos += 2
+            else:
+                while response[pos] != 0:
+                    pos += response[pos] + 1
+                pos += 1
+            # pos is now at TYPE; TTL is at pos+4 (skip type=2, class=2)
+            ttl = struct.unpack('>I', response[pos + 4:pos + 8])[0]
+            return max(ttl, 10)  # Floor at 10s to avoid constant re-queries
+        except Exception:
+            return None
+
+    def get(self, domain: str, qtype: int, new_txid: bytes) -> bytes | None:
+        """Look up cached response. Rewrites transaction ID for the new query."""
+        key = (domain, qtype)
+        with self.lock:
+            entry = self.cache.get(key)
+            if entry is None:
+                return None
+            response_bytes, expiry = entry
+            if time.time() > expiry:
+                del self.cache[key]
+                return None
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+        # Rewrite transaction ID (bytes 0:2)
+        return new_txid + response_bytes[2:]
+
+    def put(self, domain: str, qtype: int, response: bytes):
+        """Cache a DNS response, parsing TTL from the answer."""
+        ttl = self._parse_ttl(response) or FORWARD_CACHE_DEFAULT_TTL
+        key = (domain, qtype)
+        expiry = time.time() + ttl
+        with self.lock:
+            self.cache[key] = (response, expiry)
+            self.cache.move_to_end(key)
+            # Evict oldest if over capacity
+            while len(self.cache) > self.max_entries:
+                self.cache.popitem(last=False)
+
+
+# ============================================================
+# Discord IP Cache (voice tracking + file persistence)
 # ============================================================
 
 class DNSCache:
@@ -242,7 +313,7 @@ class DNSCache:
         self.cache = {}
         self.lock = threading.Lock()
         self.load()
-    
+
     def load(self):
         try:
             if os.path.exists(self.cache_file):
@@ -250,14 +321,18 @@ class DNSCache:
                     self.cache = json.load(f)
         except Exception:
             self.cache = {}
-    
+
     def save(self):
+        """Atomic write to prevent UDP proxy from reading partial JSON."""
         try:
-            with open(self.cache_file, 'w') as f:
+            dir_name = os.path.dirname(self.cache_file) or '/tmp'
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
                 json.dump(self.cache, f, indent=2)
+            os.replace(tmp_path, self.cache_file)
         except Exception as e:
             print(f"[Cache] Save error: {e}")
-    
+
     def set(self, domain: str, ip: str, is_voice: bool = False):
         with self.lock:
             self.cache[domain] = {
@@ -271,9 +346,23 @@ class DNSCache:
                     'ip': ip,
                     'timestamp': time.time()
                 }
+                # Per-domain voice IP tracking
+                if '_voice_domains' not in self.cache:
+                    self.cache['_voice_domains'] = {}
+                self.cache['_voice_domains'][domain] = {
+                    'ip': ip,
+                    'timestamp': time.time()
+                }
         # Save outside lock to avoid blocking other threads on file I/O
         self.save()
-    
+
+    def get_voice_domains(self) -> list[str]:
+        """Return list of recently-seen voice domains for re-resolution."""
+        with self.lock:
+            vd = self.cache.get('_voice_domains', {})
+            now = time.time()
+            return [d for d, e in vd.items() if now - e['timestamp'] < CACHE_TTL]
+
     def get_latest_voice(self) -> tuple[str, str] | None:
         with self.lock:
             if '_latest_voice' in self.cache:
@@ -293,7 +382,14 @@ class DiscordDNS:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((LISTEN_HOST, LISTEN_PORT))
         self.cache = DNSCache(CACHE_FILE)
+        self.forward_cache = ForwardCache()
         self.resolver_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='dns-resolve')
+
+        # Start periodic voice re-resolution thread
+        self._re_resolve_thread = threading.Thread(
+            target=self._periodic_re_resolve, daemon=True
+        )
+        self._re_resolve_thread.start()
 
         print(f"[DNS] Discord DNS Server")
         print(f"[DNS] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
@@ -333,6 +429,15 @@ class DiscordDNS:
         else:
             print(f"[DNS] ⚠️  Failed to resolve: {domain}")
 
+    def _periodic_re_resolve(self):
+        """Re-resolve known voice domains periodically to detect IP rotations."""
+        while True:
+            time.sleep(VOICE_RE_RESOLVE_INTERVAL)
+            domains = self.cache.get_voice_domains()
+            if domains:
+                for domain in domains:
+                    self._resolve_and_cache(domain, is_voice=True)
+
     def handle_query(self, data: bytes, addr: tuple):
         """Handle incoming DNS query"""
         domain = parse_domain(data)
@@ -357,10 +462,15 @@ class DiscordDNS:
                 response = build_empty_response(data)
                 self.sock.sendto(response, addr)
         else:
-            # Forward non-Discord queries to upstream
-            response = forward_query(data)
-            if response:
-                self.sock.sendto(response, addr)
+            # Non-Discord: check forward cache first
+            cached = self.forward_cache.get(domain, qtype, data[:2])
+            if cached:
+                self.sock.sendto(cached, addr)
+            else:
+                response = forward_query(data)
+                if response:
+                    self.forward_cache.put(domain, qtype, response)
+                    self.sock.sendto(response, addr)
     
     def run(self):
         """Main loop"""
