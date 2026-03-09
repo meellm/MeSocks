@@ -133,6 +133,9 @@ ExecStart=/usr/local/bin/sniproxy \
   --forward-rule=discord-activities.com --forward-rule=*.discord-activities.com \
   --forward-rule=discordpartygames.com --forward-rule=*.discordpartygames.com \
   --forward-rule=discordsays.com --forward-rule=*.discordsays.com \
+  --forward-rule=discordsez.com --forward-rule=*.discordsez.com \
+  --forward-rule=discordquests.com --forward-rule=*.discordquests.com \
+  --forward-rule=discord.app --forward-rule=*.discord.app \
   --forward-rule=dis.gd --forward-rule=*.dis.gd \
   --forward-rule=discordstatic.com --forward-rule=*.discordstatic.com
 Restart=always
