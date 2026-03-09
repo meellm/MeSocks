@@ -40,8 +40,8 @@ SERVICES = {
             "enabled": True,
             "port": 443,
             "media_patterns": [
-                r"^[a-z\-]+\d+\.discord\.gg$",
-                r"^[a-z\-]+\d+\.discord\.media$",
+                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.gg$",
+                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",
             ],
         },
     },
