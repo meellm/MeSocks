@@ -1,10 +1,10 @@
 #!/bin/bash
-# Discord VPN Proxy Setup Script
+# MeSocks - VPN Proxy Setup Script
 # Turns Pi into a SOCKS5 proxy that exits through a VPN WiFi network
 
 set -e
 
-echo "🧦 Discord VPN Proxy Setup"
+echo "🧦 MeSocks VPN Proxy Setup"
 echo "=========================="
 
 # Check if running as root for some commands
@@ -100,7 +100,7 @@ echo ""
 echo "=========================="
 echo "🎉 Setup complete!"
 echo ""
-echo "Discord settings:"
+echo "Proxy settings (for apps like Discord, etc.):"
 echo "  Type: SOCKS5"
 echo "  Host: $LOCAL_IP"
 echo "  Port: $PROXY_PORT"
