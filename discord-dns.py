@@ -13,6 +13,7 @@ This replaces sniproxy's DNS functionality.
 import socket
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import json
 import os
@@ -131,41 +132,63 @@ def build_response(query: bytes, ip: str) -> bytes:
     return bytes(response)
 
 
+def build_empty_response(query: bytes) -> bytes:
+    """Build DNS response with no answers (NXDOMAIN-style empty response)"""
+    response = bytearray()
+    response += query[:2]  # Transaction ID
+    response += b'\x81\x80'  # Flags: response, recursion available
+    response += query[4:6]  # Questions count
+    response += b'\x00\x00'  # Answers count = 0
+    response += b'\x00\x00'  # Authority count
+    response += b'\x00\x00'  # Additional count
+
+    # Copy question section
+    pos = 12
+    while query[pos] != 0:
+        pos += query[pos] + 1
+    pos += 5  # null + qtype + qclass
+    response += query[12:pos]
+
+    return bytes(response)
+
+
 def resolve_upstream(domain: str) -> str | None:
     """Resolve domain via upstream DNS, return IP or None"""
+    sock = None
     try:
         # Build query
         transaction_id = os.urandom(2)
         flags = b'\x01\x00'
         qdcount = b'\x00\x01'
         counts = b'\x00\x00\x00\x00\x00\x00'
-        
+
         qname = b''
         for part in domain.split('.'):
             qname += bytes([len(part)]) + part.encode()
         qname += b'\x00'
-        
+
         qtype = b'\x00\x01'  # A
         qclass = b'\x00\x01'  # IN
-        
+
         query = transaction_id + flags + qdcount + counts + qname + qtype + qclass
-        
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(3)
         sock.sendto(query, (UPSTREAM_DNS, UPSTREAM_PORT))
         response, _ = sock.recvfrom(1024)
         sock.close()
-        
+        sock = None
+
         # Parse response for A record
         ancount = struct.unpack('>H', response[6:8])[0]
         if ancount == 0:
             return None
-        
+
         pos = 12
         while response[pos] != 0:
             pos += response[pos] + 1
         pos += 5
-        
+
         for _ in range(ancount):
             if response[pos] & 0xC0 == 0xC0:
                 pos += 2
@@ -173,34 +196,40 @@ def resolve_upstream(domain: str) -> str | None:
                 while response[pos] != 0:
                     pos += response[pos] + 1
                 pos += 1
-            
+
             rtype = struct.unpack('>H', response[pos:pos+2])[0]
             pos += 8
             rdlength = struct.unpack('>H', response[pos:pos+2])[0]
             pos += 2
-            
+
             if rtype == 1 and rdlength == 4:
                 return '.'.join(str(b) for b in response[pos:pos+4])
             pos += rdlength
-        
+
         return None
     except Exception as e:
         print(f"[DNS] Upstream resolve error for {domain}: {e}")
         return None
+    finally:
+        if sock:
+            sock.close()
 
 
 def forward_query(query: bytes) -> bytes | None:
     """Forward query to upstream and return response"""
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(5)
         sock.sendto(query, (UPSTREAM_DNS, UPSTREAM_PORT))
         response, _ = sock.recvfrom(4096)
-        sock.close()
         return response
     except Exception as e:
         print(f"[DNS] Forward error: {e}")
         return None
+    finally:
+        if sock:
+            sock.close()
 
 
 # ============================================================
@@ -242,7 +271,8 @@ class DNSCache:
                     'ip': ip,
                     'timestamp': time.time()
                 }
-            self.save()
+        # Save outside lock to avoid blocking other threads on file I/O
+        self.save()
     
     def get_latest_voice(self) -> tuple[str, str] | None:
         with self.lock:
@@ -263,7 +293,8 @@ class DiscordDNS:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((LISTEN_HOST, LISTEN_PORT))
         self.cache = DNSCache(CACHE_FILE)
-        
+        self.resolver_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='dns-resolve')
+
         print(f"[DNS] Discord DNS Server")
         print(f"[DNS] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
         print(f"[DNS] Upstream: {UPSTREAM_DNS}")
@@ -290,35 +321,43 @@ class DiscordDNS:
                 return True
         return False
     
+    def _resolve_and_cache(self, domain: str, is_voice: bool):
+        """Resolve real Discord IP in background and cache it"""
+        real_ip = resolve_upstream(domain)
+        if real_ip:
+            self.cache.set(domain, real_ip, is_voice)
+            if is_voice:
+                print(f"[DNS] 🎤 VOICE: {domain} -> {real_ip}")
+            else:
+                print(f"[DNS] 📝 Discord: {domain} -> {real_ip}")
+        else:
+            print(f"[DNS] ⚠️  Failed to resolve: {domain}")
+
     def handle_query(self, data: bytes, addr: tuple):
         """Handle incoming DNS query"""
         domain = parse_domain(data)
         qtype = parse_query_type(data)
-        
+
         if not domain:
             return
-        
-        # Only handle A queries for Discord domains
-        if qtype == 1 and self.is_discord_domain(domain):
-            is_voice = self.is_voice_domain(domain)
-            
-            # Resolve real IP in background (or foreground for voice)
-            real_ip = resolve_upstream(domain)
-            
-            if real_ip:
-                self.cache.set(domain, real_ip, is_voice)
-                if is_voice:
-                    print(f"[DNS] 🎤 VOICE: {domain} -> {real_ip} (returning {PI_IP})")
-                else:
-                    print(f"[DNS] 📝 Discord: {domain} -> {real_ip} (returning {PI_IP})")
+
+        if self.is_discord_domain(domain):
+            if qtype == 1:  # A record
+                is_voice = self.is_voice_domain(domain)
+
+                # Send hijacked response immediately (don't block on upstream)
+                response = build_response(data, PI_IP)
+                self.sock.sendto(response, addr)
+
+                # Resolve and cache real IP in background for the UDP proxy
+                self.resolver_pool.submit(self._resolve_and_cache, domain, is_voice)
             else:
-                print(f"[DNS] ⚠️  Failed to resolve: {domain}")
-            
-            # Return hijacked response
-            response = build_response(data, PI_IP)
-            self.sock.sendto(response, addr)
+                # Non-A queries (AAAA, etc) for Discord domains: return empty
+                # response to prevent leaking real IPs via IPv6 lookups
+                response = build_empty_response(data)
+                self.sock.sendto(response, addr)
         else:
-            # Forward to upstream
+            # Forward non-Discord queries to upstream
             response = forward_query(data)
             if response:
                 self.sock.sendto(response, addr)
@@ -342,13 +381,30 @@ class DiscordDNS:
 # Main
 # ============================================================
 
+def validate_ip(ip: str) -> bool:
+    """Check if string is a valid IPv4 address"""
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
 def main():
     # Check for custom PI_IP
     global PI_IP
     if len(sys.argv) > 1:
         PI_IP = sys.argv[1]
         print(f"[*] Using custom hijack IP: {PI_IP}")
-    
+
+    if not validate_ip(PI_IP):
+        print(f"[DNS] ❌ Invalid PI_IP: '{PI_IP}'")
+        print(f"      Set it via: config_local.py, or pass as argument:")
+        print(f"      sudo python3 {sys.argv[0]} <your-pi-ip>")
+        sys.exit(1)
+
     print("=" * 60)
     print("Discord DNS Server with IP Tracking")
     print("=" * 60)
@@ -358,10 +414,9 @@ def main():
     print("  2. Resolves real IPs → caches for UDP proxy")
     print("  3. Forwards other queries → upstream DNS")
     print()
-    
-    server = DiscordDNS()
-    
+
     try:
+        server = DiscordDNS()
         server.run()
     except KeyboardInterrupt:
         print("\n[DNS] Shutting down...")

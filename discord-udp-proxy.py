@@ -27,6 +27,7 @@ import os
 # Config
 LISTEN_HOST = '0.0.0.0'
 LISTEN_PORT = 443
+DISCORD_VOICE_PORT = 443  # Discord voice server destination port
 TRACKING_FILE = '/tmp/discord-voice-ips.json'
 SESSION_TIMEOUT = 120  # seconds
 BUFFER_SIZE = 65535
@@ -118,12 +119,12 @@ class DiscordUDPProxy:
                     print(f"[UDP Proxy] ❌ No Discord IP known, dropping packet from {client_addr}")
                     return
                 
-                discord_addr = (discord_ip, LISTEN_PORT)
+                discord_addr = (discord_ip, DISCORD_VOICE_PORT)
                 session = Session(client_addr, discord_addr)
                 self.sessions[client_addr] = session
                 self.sock_to_session[session.sock.fileno()] = session
-                
-                print(f"[UDP Proxy] ✅ New session: {client_addr[0]}:{client_addr[1]} -> {discord_ip}:{LISTEN_PORT}")
+
+                print(f"[UDP Proxy] ✅ New session: {client_addr[0]}:{client_addr[1]} -> {discord_ip}:{DISCORD_VOICE_PORT}")
         
         # Forward to Discord
         try:
