@@ -1,39 +1,39 @@
-# 🧦 MeSocks
+# MeSocks
 
 **Transparent VPN proxy for restricted services on Raspberry Pi.**
 
-Route Discord (and other blocked services) through VPN — no app configuration needed. Just point your device's DNS to the Pi.
+Route Discord, Spotify, Netflix, and other blocked services through VPN — no app configuration needed. Just point your device's DNS to the Pi.
 
-## ✨ Features
+## Features
 
-- 🌍 **Bypass blocks** — ISP, country, work/school networks
-- 🎤 **Full voice support** — UDP proxying for Discord calls
-- 📱 **Any device** — Windows, Mac, Linux, iOS, Android, consoles
-- ⚡ **Transparent** — no app changes, just set DNS
-- 🔌 **Extensible** — add any restricted domain
-- 🍓 **Runs on Raspberry Pi**
+- **Bypass blocks** — ISP, country, work/school networks
+- **Full voice support** — UDP proxying for Discord calls
+- **Any device** — Windows, Mac, Linux, iOS, Android, consoles
+- **Transparent** — no app changes, just set DNS
+- **Multi-service** — add any service via config file
+- **Runs on Raspberry Pi**
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-[Any Device] ──DNS──▶ [Pi on VPN Network] ──▶ [VPN Exit] ──▶ [Internet]
+[Any Device] ──DNS──> [Pi on VPN Network] ──> [VPN Exit] ──> [Internet]
                               │
                     ┌─────────┴─────────┐
                     │                   │
                TCP :443            UDP :443
-               (sniproxy)      (discord-udp-proxy)
+               (sniproxy)        (udp-proxy)
                     │                   │
-                    ▼                   ▼
-              Discord API         Discord Voice
+                    v                   v
+              Service APIs       Voice/Media
 ```
 
 **How it works:**
 1. Device asks Pi for `discord.com` IP
 2. Pi returns its own IP (hijack)
-3. Device connects to Pi thinking it's Discord
-4. Pi forwards traffic through VPN to real Discord
+3. Device connects to Pi thinking it's the real server
+4. Pi forwards traffic through VPN to the real server
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Requirements
 
@@ -49,8 +49,8 @@ cd MeSocks
 # TCP only (text, API, images)
 sudo ./setup.sh
 
-# Full setup with voice support
-sudo ./setup-voice.sh YOUR_PI_IP
+# Full setup with voice/media support
+sudo ./setup-services.sh YOUR_PI_IP
 ```
 
 ### Configure Your Device
@@ -59,78 +59,98 @@ Point your device's DNS to your Pi's IP:
 
 | Platform | How |
 |----------|-----|
-| **Windows** | Network settings → IPv4 → DNS: `[Pi IP]` |
-| **Mac** | System Preferences → Network → DNS |
-| **iOS** | WiFi → (i) → Configure DNS → Manual |
-| **Android** | WiFi → Modify → Advanced → DNS |
+| **Windows** | Network settings > IPv4 > DNS: `[Pi IP]` |
+| **Mac** | System Preferences > Network > DNS |
+| **iOS** | WiFi > (i) > Configure DNS > Manual |
+| **Android** | WiFi > Modify > Advanced > DNS |
 | **Linux** | `/etc/resolv.conf` or NetworkManager |
 
-That's it! Discord now routes through VPN.
+That's it! Configured services now route through VPN.
 
-## 📋 Services
+## Adding Services
+
+Copy the example config and edit it:
+
+```bash
+cp services_config.example.py services_config.py
+nano services_config.py
+```
+
+Each service is a dict entry with a list of domains:
+
+```python
+SERVICES = {
+    "discord": {
+        "domains": ["discord.com", "discord.gg", "discordapp.com", ...],
+        "udp_proxy": {  # Optional: only for services needing UDP
+            "enabled": True,
+            "port": 443,
+            "media_patterns": [r"^[a-z\-]+\d+\.discord\.gg$"],
+        },
+    },
+    "spotify": {
+        "domains": ["spotify.com", "scdn.co", "spotifycdn.com"],
+    },
+    "netflix": {
+        "domains": ["netflix.com", "nflxvideo.net", "nflximg.net"],
+    },
+}
+```
+
+After editing, re-run setup to apply:
+
+```bash
+sudo ./setup-services.sh YOUR_PI_IP
+sudo systemctl restart mesocks-dns mesocks-sniproxy
+```
+
+If you don't create `services_config.py`, the default Discord-only config is used automatically.
+
+## Services
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| `discord-dns` | UDP 53 | DNS hijack + IP caching |
-| `discord-udp-proxy` | UDP 443 | Voice traffic forwarding |
-| `sniproxy-discord` | TCP 443/80 | HTTPS/HTTP forwarding |
+| `mesocks-dns` | UDP 53 | DNS hijack + IP caching |
+| `mesocks-udp-proxy` | UDP 443 | Voice/media traffic forwarding |
+| `mesocks-sniproxy` | TCP 443/80 | HTTPS/HTTP forwarding |
 | `socks-proxy` | TCP 1080 | SOCKS5 backend |
 
 ### Commands
 
 ```bash
 # Check status
-sudo systemctl status discord-dns
-sudo systemctl status discord-udp-proxy
+sudo systemctl status mesocks-dns
+sudo systemctl status mesocks-udp-proxy
 
 # View logs
-journalctl -u discord-dns -f
+journalctl -u mesocks-dns -f
 
 # Restart all
-sudo systemctl restart discord-dns sniproxy-discord discord-udp-proxy
+sudo systemctl restart mesocks-dns mesocks-sniproxy mesocks-udp-proxy
 ```
 
-## 🌐 Covered Domains
-
-Currently configured for Discord:
-- `discord.com`, `discord.gg`, `discord.media`
-- `discordapp.com`, `discordapp.net`, `discordcdn.com`
-- Voice servers (`*.discord.gg`)
-- And 15+ more Discord-related domains
-
-### Adding More Services
-
-Edit the domain list in `discord-dns.py` to add other blocked services:
-
-```python
-DISCORD_DOMAINS = [
-    "discord.com",
-    "discord.gg",
-    # Add your domains here:
-    "example-blocked-site.com",
-]
-```
-
-## 🔧 Components
+## Components
 
 | File | Purpose |
 |------|---------|
-| `discord-dns.py` | DNS server — hijacks domains, caches real IPs |
-| `discord-udp-proxy.py` | UDP proxy — forwards voice traffic |
+| `dns-proxy.py` | DNS server — hijacks domains, caches real IPs |
+| `udp-proxy.py` | UDP proxy — forwards voice/media traffic |
 | `setup.sh` | Basic setup (TCP only) |
-| `setup-voice.sh` | Full setup with voice support |
+| `setup-services.sh` | Full setup with voice/media support |
+| `services_default.py` | Built-in Discord config (fallback) |
+| `services_config.example.py` | Example config with Spotify/Netflix/YouTube |
 
 ### External Dependencies
 
 - **[sniproxy](https://github.com/ameshkov/sniproxy)** — SNI-based TCP proxy
 - **[microsocks](https://github.com/rofl0r/microsocks)** — Lightweight SOCKS5 server
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 **Text works, voice doesn't:**
 ```bash
-sudo systemctl status discord-udp-proxy
-cat /tmp/discord-voice-ips.json
+sudo systemctl status mesocks-udp-proxy
+cat /tmp/mesocks-media-ips.json
 ```
 
 **DNS not resolving:**
@@ -138,24 +158,25 @@ cat /tmp/discord-voice-ips.json
 nslookup discord.com YOUR_PI_IP
 ```
 
-**Can't reach Discord at all:**
+**Can't reach service at all:**
 ```bash
-# Check if Pi can reach Discord through VPN
+# Check if Pi can reach the service through VPN
 curl -I https://discord.com
 ```
 
-## 📁 File Locations
+## File Locations
 
 | File | Location |
 |------|----------|
-| Voice IP cache | `/tmp/discord-voice-ips.json` |
-| Services | `/etc/systemd/system/discord-*.service` |
+| Media IP cache | `/tmp/mesocks-media-ips.json` |
+| Services | `/etc/systemd/system/mesocks-*.service` |
 | sniproxy | `/usr/local/bin/sniproxy` |
+| User config | `services_config.py` (create from example) |
 
-## 📄 License
+## License
 
 MIT
 
 ---
 
-Built for bypassing unfair restrictions. 🧦
+Built for bypassing unfair restrictions.

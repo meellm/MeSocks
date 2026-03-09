@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Discord DNS Server
+MeSocks DNS Proxy
 
 Custom DNS server that:
-1. Hijacks Discord domains (returns Pi's IP)
-2. BUT also resolves and caches real IPs for UDP forwarding
+1. Hijacks configured service domains (returns Pi's IP)
+2. Resolves and caches real IPs for UDP forwarding
 3. Forwards all other queries to upstream
 
-This replaces sniproxy's DNS functionality.
+Supports multiple services via services_config.py.
 """
 
 import socket
@@ -21,6 +21,7 @@ import time
 import json
 import os
 import re
+import shutil
 import sys
 
 # ============================================================
@@ -32,12 +33,13 @@ LISTEN_PORT = 53
 UPSTREAM_DNS_SERVERS = ['8.8.8.8', '1.1.1.1', '8.8.4.4']  # Fallback DNS servers
 UPSTREAM_PORT = 53
 PI_IP = 'YOUR_PI_IP'  # IP to return for hijacked domains (override in config_local.py)
-CACHE_FILE = '/tmp/discord-voice-ips.json'
+CACHE_FILE = '/tmp/mesocks-media-ips.json'
+OLD_CACHE_FILE = '/tmp/discord-voice-ips.json'  # For migration
 CACHE_TTL = 300  # 5 minutes
 HIJACK_TTL = 300  # TTL for hijacked responses (Pi IP doesn't change)
-FORWARD_CACHE_MAX = 4096  # Max cached non-Discord DNS responses
+FORWARD_CACHE_MAX = 4096  # Max cached non-hijacked DNS responses
 FORWARD_CACHE_DEFAULT_TTL = 60  # Fallback TTL if parsing fails
-VOICE_RE_RESOLVE_INTERVAL = 60  # Re-resolve voice domains every N seconds
+MEDIA_RE_RESOLVE_INTERVAL = 60  # Re-resolve media domains every N seconds
 QUERY_WORKERS = 32  # Max concurrent query handler threads
 RATE_LIMIT_PER_SEC = 50  # Max queries per second per source IP
 STATS_INTERVAL = 60  # Print stats every N seconds
@@ -58,41 +60,23 @@ except ImportError:
 except Exception as e:
     print(f"[DNS] Warning: config_local.py error: {e}, using defaults")
 
-# Discord domains to hijack
-DISCORD_DOMAINS = [
-    'discord.com',
-    'discord.gg',
-    'discord.media',
-    'discord.gift',
-    'discord.gifts',
-    'discord.new',
-    'discord.dev',
-    'discord.co',
-    'discord.store',
-    'discord.tools',
-    'discord.design',
-    'discordapp.com',
-    'discordapp.net',
-    'discordapp.io',
-    'discordcdn.com',
-    'discordstatus.com',
-    'discordmerch.com',
-    'discordactivities.com',
-    'discord-activities.com',
-    'discordpartygames.com',
-    'discordsays.com',
-    'discordsez.com',
-    'discordquests.com',
-    'discord.app',
-    'dis.gd',
-    'discordstatic.com',
-]
+# Load service definitions
+try:
+    from services_config import SERVICES
+except ImportError:
+    from services_default import SERVICES
 
-# Voice server patterns (for logging)
-VOICE_PATTERNS = [
-    r'^[a-z\-]+\d+\.discord\.gg$',
-    r'^[a-z\-]+\d+\.discord\.media$',
-]
+# Flatten service config into working data structures
+HIJACK_DOMAINS = []       # List of base domains to hijack
+MEDIA_PATTERNS = []       # Compiled regexes for media/voice detection
+
+for _svc_name, _svc_cfg in SERVICES.items():
+    for _domain in _svc_cfg.get('domains', []):
+        HIJACK_DOMAINS.append(_domain)
+    _udp = _svc_cfg.get('udp_proxy')
+    if _udp and _udp.get('enabled'):
+        for _pattern in _udp.get('media_patterns', []):
+            MEDIA_PATTERNS.append(re.compile(_pattern))
 
 # ============================================================
 # DNS Utilities
@@ -136,14 +120,14 @@ def build_response(query: bytes, ip: str) -> bytes:
     response += b'\x00\x01'  # Answers count = 1
     response += b'\x00\x00'  # Authority count
     response += b'\x00\x00'  # Additional count
-    
+
     # Copy question section
     pos = 12
     while query[pos] != 0:
         pos += query[pos] + 1
     pos += 5  # null + qtype + qclass
     response += query[12:pos]
-    
+
     # Add answer
     response += b'\xc0\x0c'  # Pointer to domain name in question
     response += b'\x00\x01'  # Type A
@@ -151,7 +135,7 @@ def build_response(query: bytes, ip: str) -> bytes:
     response += struct.pack('>I', HIJACK_TTL)  # TTL for hijacked response
     response += b'\x00\x04'  # Data length
     response += bytes(int(x) for x in ip.split('.'))  # IP address
-    
+
     return bytes(response)
 
 
@@ -262,11 +246,11 @@ def forward_query(query: bytes) -> bytes | None:
 
 
 # ============================================================
-# Forward DNS Cache (non-Discord queries)
+# Forward DNS Cache (non-hijacked queries)
 # ============================================================
 
 class ForwardCache:
-    """In-memory cache for non-Discord DNS responses to avoid repeated upstream queries."""
+    """In-memory cache for non-hijacked DNS responses to avoid repeated upstream queries."""
 
     def __init__(self, max_entries: int = FORWARD_CACHE_MAX):
         self.max_entries = max_entries
@@ -327,10 +311,10 @@ class ForwardCache:
 
 
 # ============================================================
-# Discord IP Cache (voice tracking + file persistence)
+# Media IP Cache (voice/media tracking + file persistence)
 # ============================================================
 
-class DNSCache:
+class MediaCache:
     def __init__(self, cache_file: str):
         self.cache_file = cache_file
         self.cache = {}
@@ -356,40 +340,40 @@ class DNSCache:
         except Exception as e:
             print(f"[Cache] Save error: {e}")
 
-    def set(self, domain: str, ip: str, is_voice: bool = False):
+    def set(self, domain: str, ip: str, is_media: bool = False):
         with self.lock:
             self.cache[domain] = {
                 'ip': ip,
                 'timestamp': time.time(),
-                'is_voice': is_voice
+                'is_media': is_media
             }
-            if is_voice:
-                self.cache['_latest_voice'] = {
+            if is_media:
+                self.cache['_latest_media'] = {
                     'domain': domain,
                     'ip': ip,
                     'timestamp': time.time()
                 }
-                # Per-domain voice IP tracking
-                if '_voice_domains' not in self.cache:
-                    self.cache['_voice_domains'] = {}
-                self.cache['_voice_domains'][domain] = {
+                # Per-domain media IP tracking
+                if '_media_domains' not in self.cache:
+                    self.cache['_media_domains'] = {}
+                self.cache['_media_domains'][domain] = {
                     'ip': ip,
                     'timestamp': time.time()
                 }
         # Save outside lock to avoid blocking other threads on file I/O
         self.save()
 
-    def get_voice_domains(self) -> list[str]:
-        """Return list of recently-seen voice domains for re-resolution."""
+    def get_media_domains(self) -> list[str]:
+        """Return list of recently-seen media domains for re-resolution."""
         with self.lock:
-            vd = self.cache.get('_voice_domains', {})
+            vd = self.cache.get('_media_domains', {})
             now = time.time()
             return [d for d, e in vd.items() if now - e['timestamp'] < CACHE_TTL]
 
-    def get_latest_voice(self) -> tuple[str, str] | None:
+    def get_latest_media(self) -> tuple[str, str] | None:
         with self.lock:
-            if '_latest_voice' in self.cache:
-                entry = self.cache['_latest_voice']
+            if '_latest_media' in self.cache:
+                entry = self.cache['_latest_media']
                 if time.time() - entry['timestamp'] < CACHE_TTL:
                     return (entry['domain'], entry['ip'])
         return None
@@ -478,72 +462,87 @@ class Stats:
 
 
 # ============================================================
-# DNS Server
+# DNS Proxy Server
 # ============================================================
 
-class DiscordDNS:
+class DNSProxy:
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((LISTEN_HOST, LISTEN_PORT))
-        self.cache = DNSCache(CACHE_FILE)
+        self.cache = MediaCache(CACHE_FILE)
         self.forward_cache = ForwardCache()
         self.rate_limiter = RateLimiter()
         self.stats = Stats()
         self.resolver_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='dns-resolve')
         self.query_pool = ThreadPoolExecutor(max_workers=QUERY_WORKERS, thread_name_prefix='dns-query')
 
+        # Build service name lookup for logging
+        self._domain_to_service: dict[str, str] = {}
+        for svc_name, svc_cfg in SERVICES.items():
+            for d in svc_cfg.get('domains', []):
+                self._domain_to_service[d] = svc_name
+
         # Background threads
         threading.Thread(target=self._periodic_re_resolve, daemon=True).start()
         threading.Thread(target=self._periodic_stats, daemon=True).start()
 
-        print(f"[DNS] Discord DNS Server")
+        svc_names = ', '.join(SERVICES.keys())
+        print(f"[DNS] MeSocks DNS Proxy")
         print(f"[DNS] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
         print(f"[DNS] Upstream: {', '.join(UPSTREAM_DNS_SERVERS)}")
         print(f"[DNS] Hijack IP: {PI_IP}")
         print(f"[DNS] Cache file: {CACHE_FILE}")
-        print(f"[DNS] Hijacking {len(DISCORD_DOMAINS)} Discord domains")
+        print(f"[DNS] Hijacking {len(HIJACK_DOMAINS)} domains across {len(SERVICES)} service(s): {svc_names}")
         print(f"[DNS] Rate limit: {RATE_LIMIT_PER_SEC}/sec per IP, private networks only")
-    
-    def is_discord_domain(self, domain: str) -> bool:
+
+    def _get_service_name(self, domain: str) -> str:
+        """Return the service name for a hijacked domain."""
+        for d, svc in self._domain_to_service.items():
+            if domain == d or domain.endswith('.' + d):
+                return svc
+        return 'unknown'
+
+    def is_hijacked_domain(self, domain: str) -> bool:
         """Check if domain should be hijacked"""
         if not domain:
             return False
         domain = domain.lower()
-        for d in DISCORD_DOMAINS:
+        for d in HIJACK_DOMAINS:
             if domain == d or domain.endswith('.' + d):
                 return True
         return False
-    
-    def is_voice_domain(self, domain: str) -> bool:
-        """Check if domain is a voice server"""
+
+    def is_media_domain(self, domain: str) -> bool:
+        """Check if domain is a media/voice server"""
         if not domain:
             return False
-        for pattern in VOICE_PATTERNS:
-            if re.match(pattern, domain.lower()):
+        for pattern in MEDIA_PATTERNS:
+            if pattern.match(domain.lower()):
                 return True
         return False
-    
-    def _resolve_and_cache(self, domain: str, is_voice: bool):
-        """Resolve real Discord IP in background and cache it"""
+
+    def _resolve_and_cache(self, domain: str, is_media: bool):
+        """Resolve real IP in background and cache it"""
         real_ip = resolve_upstream(domain)
+        svc = self._get_service_name(domain)
         if real_ip:
-            self.cache.set(domain, real_ip, is_voice)
-            if is_voice:
-                print(f"[DNS] 🎤 VOICE: {domain} -> {real_ip}")
+            self.cache.set(domain, real_ip, is_media)
+            if is_media:
+                print(f"[DNS] [{svc}] MEDIA: {domain} -> {real_ip}")
             else:
-                print(f"[DNS] 📝 Discord: {domain} -> {real_ip}")
+                print(f"[DNS] [{svc}] {domain} -> {real_ip}")
         else:
-            print(f"[DNS] ⚠️  Failed to resolve: {domain}")
+            print(f"[DNS] [{svc}] Failed to resolve: {domain}")
 
     def _periodic_re_resolve(self):
-        """Re-resolve known voice domains periodically to detect IP rotations."""
+        """Re-resolve known media domains periodically to detect IP rotations."""
         while True:
-            time.sleep(VOICE_RE_RESOLVE_INTERVAL)
+            time.sleep(MEDIA_RE_RESOLVE_INTERVAL)
             try:
-                domains = self.cache.get_voice_domains()
+                domains = self.cache.get_media_domains()
                 for domain in domains:
-                    self._resolve_and_cache(domain, is_voice=True)
+                    self._resolve_and_cache(domain, is_media=True)
             except Exception as e:
                 print(f"[DNS] Re-resolve error: {e}")
 
@@ -553,13 +552,13 @@ class DiscordDNS:
             time.sleep(STATS_INTERVAL)
             try:
                 s = self.stats.snapshot()
-                voice_domains = self.cache.get_voice_domains()
+                media_domains = self.cache.get_media_domains()
                 fwd_cache_size = len(self.forward_cache.cache)
                 print(f"[DNS] Stats: {s['total']} queries | "
                       f"{s['hijacked']} hijacked | "
                       f"{s['cache_hits']} cache hits / {s['cache_misses']} misses | "
                       f"{s['rate_limited']} rate-limited | {s['blocked']} blocked | "
-                      f"fwd_cache={fwd_cache_size} | voice_domains={len(voice_domains)}")
+                      f"fwd_cache={fwd_cache_size} | media_domains={len(media_domains)}")
                 self.rate_limiter.cleanup()
             except Exception as e:
                 print(f"[DNS] Stats error: {e}")
@@ -583,24 +582,24 @@ class DiscordDNS:
         if not domain:
             return
 
-        if self.is_discord_domain(domain):
+        if self.is_hijacked_domain(domain):
             self.stats.inc('hijacked')
             if qtype == 1:  # A record
-                is_voice = self.is_voice_domain(domain)
+                is_media = self.is_media_domain(domain)
 
                 # Send hijacked response immediately (don't block on upstream)
                 response = build_response(data, PI_IP)
                 self.sock.sendto(response, addr)
 
                 # Resolve and cache real IP in background for the UDP proxy
-                self.resolver_pool.submit(self._resolve_and_cache, domain, is_voice)
+                self.resolver_pool.submit(self._resolve_and_cache, domain, is_media)
             else:
-                # Non-A queries (AAAA, etc) for Discord domains: return empty
+                # Non-A queries (AAAA, etc) for hijacked domains: return empty
                 # response to prevent leaking real IPs via IPv6 lookups
                 response = build_empty_response(data)
                 self.sock.sendto(response, addr)
         else:
-            # Non-Discord: check forward cache first
+            # Non-hijacked: check forward cache first
             cached = self.forward_cache.get(domain, qtype, data[:2])
             if cached:
                 self.stats.inc('cache_hits')
@@ -613,7 +612,7 @@ class DiscordDNS:
                     self.sock.sendto(response, addr)
                 else:
                     self.stats.inc('upstream_failures')
-    
+
     def run(self):
         """Main loop"""
         print("[DNS] Running...")
@@ -640,6 +639,16 @@ def validate_ip(ip: str) -> bool:
         return False
 
 
+def migrate_cache():
+    """Migrate old cache file to new path if needed."""
+    if os.path.exists(OLD_CACHE_FILE) and not os.path.exists(CACHE_FILE):
+        try:
+            shutil.move(OLD_CACHE_FILE, CACHE_FILE)
+            print(f"[DNS] Migrated cache: {OLD_CACHE_FILE} -> {CACHE_FILE}")
+        except Exception as e:
+            print(f"[DNS] Cache migration failed: {e}")
+
+
 def main():
     # Check for custom PI_IP
     global PI_IP
@@ -648,28 +657,32 @@ def main():
         print(f"[*] Using custom hijack IP: {PI_IP}")
 
     if not validate_ip(PI_IP):
-        print(f"[DNS] ❌ Invalid PI_IP: '{PI_IP}'")
+        print(f"[DNS] Invalid PI_IP: '{PI_IP}'")
         print(f"      Set it via: config_local.py, or pass as argument:")
         print(f"      sudo python3 {sys.argv[0]} <your-pi-ip>")
         sys.exit(1)
 
+    migrate_cache()
+
+    svc_list = ', '.join(SERVICES.keys())
     print("=" * 60)
-    print("Discord DNS Server with IP Tracking")
+    print("MeSocks DNS Proxy")
     print("=" * 60)
     print()
     print("This server:")
-    print("  1. Hijacks Discord domains → returns Pi's IP")
-    print("  2. Resolves real IPs → caches for UDP proxy")
-    print(f"  3. Forwards other queries → {', '.join(UPSTREAM_DNS_SERVERS)}")
+    print(f"  1. Hijacks service domains -> returns Pi's IP")
+    print(f"  2. Resolves real IPs -> caches for UDP proxy")
+    print(f"  3. Forwards other queries -> {', '.join(UPSTREAM_DNS_SERVERS)}")
+    print(f"  4. Services: {svc_list}")
     print()
 
     try:
-        server = DiscordDNS()
+        server = DNSProxy()
         server.run()
     except KeyboardInterrupt:
         print("\n[DNS] Shutting down...")
     except PermissionError:
-        print("\n[DNS] ❌ Permission denied. Run with sudo:")
+        print("\n[DNS] Permission denied. Run with sudo:")
         print(f"      sudo python3 {sys.argv[0]}")
         sys.exit(1)
 
