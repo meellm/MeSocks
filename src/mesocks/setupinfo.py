@@ -7,16 +7,18 @@ Usage:
     python3 -m mesocks.setupinfo summary        # "1 service(s): discord (26 domains)"
     python3 -m mesocks.setupinfo forward-rules  # sniproxy --forward-rule lines
     python3 -m mesocks.setupinfo has-udp        # "True" / "False"
+    python3 -m mesocks.setupinfo udp-port       # UDP listen port
 """
 
 import sys
 
-from .profiles import load_services, udp_configs
+from .profiles import load_services, udp_configs, udp_listen_port
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1 or argv[0] not in ('summary', 'forward-rules', 'has-udp'):
+    commands = ('summary', 'forward-rules', 'has-udp', 'udp-port')
+    if len(argv) != 1 or argv[0] not in commands:
         print(__doc__.strip(), file=sys.stderr)
         return 2
 
@@ -35,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         print(' \\\n'.join(rules))
     elif command == 'has-udp':
         print(bool(udp_configs(services)))
+    elif command == 'udp-port':
+        print(udp_listen_port(services))
     return 0
 
 

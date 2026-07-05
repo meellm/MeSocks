@@ -7,7 +7,7 @@ A profile is a plain dict:
         "enabled": True,                   # optional, defaults to True
         "udp_proxy": {                     # optional, only for UDP media services
             "enabled": True,
-            "port": 443,
+            "port": 50000,
             "media_patterns": [r"^media\\d+\\.example\\.com$"],
         },
     }
@@ -53,7 +53,7 @@ DISCORD = {
     ],
     "udp_proxy": {
         "enabled": True,
-        "port": 443,
+        "port": 50000,
         "media_patterns": [
             # Voice/media hostnames like "russia9001.discord.gg" or
             # "ams1234.discord.media" - a region word plus a number.

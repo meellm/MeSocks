@@ -40,7 +40,7 @@ SNI proxying, and forwards UDP media traffic when a profile needs it.
     | records media host -> real IP
     v
 [mesocks-sniproxy :443/:80] ---- SOCKS5 ----> [VPN path] ----> Service TCP
-[mesocks-udp-proxy :443/udp] ---------------> [VPN path] ----> Service UDP media
+[mesocks-udp-proxy :50000/udp] -------------> [VPN path] ----> Service UDP media
 ```
 
 The DNS server is the control plane: it decides which domains belong to active
@@ -110,7 +110,7 @@ SERVICES = {
         "domains": ["discord.com", "discord.gg", "discord.media"],
         "udp_proxy": {
             "enabled": True,
-            "port": 443,
+            "port": 50000,
             "media_patterns": [
                 r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",
             ],

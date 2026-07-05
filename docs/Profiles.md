@@ -30,7 +30,7 @@ SERVICES = {
         "domains": ["discord.com", "discord.gg", "discord.media"],
         "udp_proxy": {
             "enabled": True,
-            "port": 443,
+            "port": 50000,
             "media_patterns": [r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$"],
         },
     },
@@ -44,7 +44,7 @@ SERVICES = {
 | `domains` | yes | Base domains to hijack. Subdomains match automatically. |
 | `enabled` | no | Set `False` to keep a profile in the file but disable it. |
 | `udp_proxy.enabled` | no | Enables DNS media tracking and the UDP proxy for this service. |
-| `udp_proxy.port` | no | UDP listen and remote port. Defaults to `443`. |
+| `udp_proxy.port` | no | UDP listen and remote port. Defaults to `443`; Discord uses `50000`. |
 | `udp_proxy.media_patterns` | no | Regexes for media/voice hostnames that should be tracked per client. |
 
 ## Notes

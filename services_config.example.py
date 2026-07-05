@@ -47,7 +47,7 @@ SERVICES = {
         ],
         "udp_proxy": {
             "enabled": True,
-            "port": 443,
+            "port": 50000,
             "media_patterns": [
                 r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.gg$",
                 r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",

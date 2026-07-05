@@ -6,7 +6,7 @@
 # Architecture:
 #   dns-proxy.py   - Port 53: DNS hijack + real IP tracking
 #   sniproxy       - Port 443/80: TCP (HTTPS/HTTP) proxy
-#   udp-proxy.py   - Port 443 UDP: Media/voice forwarding (if any service needs it)
+#   udp-proxy.py   - Profile UDP port: Media/voice forwarding (if any service needs it)
 #
 
 set -e
@@ -69,6 +69,7 @@ setupinfo() {
 FORWARD_RULES=$(setupinfo forward-rules)
 SERVICE_SUMMARY=$(setupinfo summary)
 HAS_UDP=$(setupinfo has-udp)
+UDP_PORT=$(setupinfo udp-port)
 
 echo "Configured: $SERVICE_SUMMARY"
 echo
@@ -215,7 +216,7 @@ echo "Architecture:"
 echo "  dns-proxy.py   -> Port 53 (DNS hijack + IP tracking)"
 echo "  sniproxy       -> Port 443/80 TCP (HTTPS proxy)"
 if [ "$HAS_UDP" = "True" ]; then
-echo "  udp-proxy.py   -> Port 443 UDP (media/voice forwarding)"
+echo "  udp-proxy.py   -> Port $UDP_PORT UDP (media/voice forwarding)"
 fi
 echo
 echo "To start services:"

@@ -2,7 +2,7 @@
 
 import unittest
 
-from mesocks.profiles import ServiceMatcher, udp_configs, udp_listen_port
+from mesocks.profiles import BUILTIN_PROFILES, ServiceMatcher, udp_configs, udp_listen_port
 
 
 class TestProfiles(unittest.TestCase):
@@ -30,6 +30,12 @@ class TestProfiles(unittest.TestCase):
         }
         self.assertEqual(udp_configs(services), {'one': {'port': 8443}})
         self.assertEqual(udp_listen_port(services, default=443), 8443)
+
+    def test_discord_builtin_uses_voice_udp_port(self):
+        self.assertEqual(
+            BUILTIN_PROFILES['discord']['udp_proxy']['port'],
+            50000,
+        )
 
     def test_udp_port_falls_back_when_profiles_disagree(self):
         services = {
