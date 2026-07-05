@@ -18,6 +18,10 @@ NORMAL_WIFI="YOUR_NORMAL_WIFI"           # Normal WiFi (fallback)
 VPN_PRIORITY=100
 NORMAL_PRIORITY=50
 PROXY_PORT=1080
+# microsocks has no authentication. Keep it on loopback (only sniproxy uses it).
+# Set PROXY_BIND=0.0.0.0 in config_local.sh ONLY if you need direct SOCKS5
+# access from other devices AND trust everyone on the network.
+PROXY_BIND=127.0.0.1
 
 # Load local config if exists (keeps secrets out of git)
 [ -f "$(dirname "$0")/config_local.sh" ] && source "$(dirname "$0")/config_local.sh"
@@ -43,10 +47,13 @@ Description=SOCKS5 Proxy (microsocks)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/microsocks -i 0.0.0.0 -p $PROXY_PORT
+ExecStart=/usr/bin/microsocks -i $PROXY_BIND -p $PROXY_PORT
 Restart=always
 RestartSec=5
 User=nobody
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
@@ -85,7 +92,7 @@ fi
 
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 echo "📍 Local IP: $LOCAL_IP"
-echo "🔌 Proxy: $LOCAL_IP:$PROXY_PORT"
+echo "🔌 Proxy: $PROXY_BIND:$PROXY_PORT"
 
 echo ""
 echo "Testing proxy..."
@@ -100,8 +107,11 @@ echo ""
 echo "=========================="
 echo "🎉 Setup complete!"
 echo ""
-echo "Proxy settings (for apps like Discord, etc.):"
-echo "  Type: SOCKS5"
-echo "  Host: $LOCAL_IP"
-echo "  Port: $PROXY_PORT"
+echo "SOCKS5 backend running on $PROXY_BIND:$PROXY_PORT (used by sniproxy)."
+echo "Next: run sudo ./setup-services.sh YOUR_PI_IP for DNS + TCP/UDP proxying."
+if [ "$PROXY_BIND" != "127.0.0.1" ]; then
+    echo ""
+    echo "⚠️  SOCKS5 is exposed on $PROXY_BIND:$PROXY_PORT with NO authentication."
+    echo "   Any device that can reach it can relay traffic through your VPN."
+fi
 echo ""

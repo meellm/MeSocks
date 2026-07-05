@@ -1,48 +1,12 @@
-"""
-MeSocks — Default Service Configuration (Discord)
+"""Compatibility shim: the built-in profiles now live in mesocks.profiles.
 
-This file provides the built-in Discord service definition.
-To customize services, copy services_config.example.py to services_config.py
-and edit it. The DNS proxy will prefer services_config.py if it exists.
+Older setups imported SERVICES from this module as the fallback when no
+services_config.py exists. Keep that import working.
 """
 
-SERVICES = {
-    "discord": {
-        "domains": [
-            "discord.com",
-            "discord.gg",
-            "discord.media",
-            "discord.gift",
-            "discord.gifts",
-            "discord.new",
-            "discord.dev",
-            "discord.co",
-            "discord.store",
-            "discord.tools",
-            "discord.design",
-            "discord.app",
-            "discordapp.com",
-            "discordapp.net",
-            "discordapp.io",
-            "discordcdn.com",
-            "discordstatus.com",
-            "discordmerch.com",
-            "discordactivities.com",
-            "discord-activities.com",
-            "discordpartygames.com",
-            "discordsays.com",
-            "discordsez.com",
-            "discordquests.com",
-            "discordstatic.com",
-            "dis.gd",
-        ],
-        "udp_proxy": {
-            "enabled": True,
-            "port": 443,
-            "media_patterns": [
-                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.gg$",
-                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",
-            ],
-        },
-    },
-}
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
+
+from mesocks.profiles import BUILTIN_PROFILES as SERVICES  # noqa: F401

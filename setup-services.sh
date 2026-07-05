@@ -39,49 +39,36 @@ if ! command -v python3 &> /dev/null; then
 fi
 echo "Python3 found"
 
+# Check sniproxy binary (required for the TCP path)
+SNIPROXY_BIN="/usr/local/bin/sniproxy"
+if [ ! -x "$SNIPROXY_BIN" ]; then
+    echo
+    echo "WARNING: $SNIPROXY_BIN not found."
+    echo "The TCP (HTTPS) path needs it. Install from:"
+    echo "  https://github.com/ameshkov/sniproxy/releases"
+    echo "Download the binary for your architecture (arm64 for Pi 3/4/5),"
+    echo "then: sudo install sniproxy $SNIPROXY_BIN"
+    echo
+    echo "Continuing setup; mesocks-sniproxy will fail to start until installed."
+    echo
+fi
+
 # Make scripts executable
 chmod +x "$SCRIPT_DIR/dns-proxy.py"
 chmod +x "$SCRIPT_DIR/udp-proxy.py"
 echo "Scripts marked executable"
 
 # ============================================================
-# Generate sniproxy forward rules from services config
+# Read the active services config (mesocks.setupinfo flattens the
+# profiles; services_config.py in this directory wins over built-ins)
 # ============================================================
-FORWARD_RULES=$(python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR')
-try:
-    from services_config import SERVICES
-except ImportError:
-    from services_default import SERVICES
-rules = []
-for svc_name, svc_cfg in SERVICES.items():
-    for domain in svc_cfg.get('domains', []):
-        rules.append(f'  --forward-rule={domain} --forward-rule=*.{domain}')
-print(' \\\\\n'.join(rules))
-")
+setupinfo() {
+    PYTHONPATH="$SCRIPT_DIR/src:$SCRIPT_DIR" python3 -m mesocks.setupinfo "$1"
+}
 
-SERVICE_SUMMARY=$(python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR')
-try:
-    from services_config import SERVICES
-except ImportError:
-    from services_default import SERVICES
-total = sum(len(s.get('domains', [])) for s in SERVICES.values())
-names = ', '.join(SERVICES.keys())
-print(f'{len(SERVICES)} service(s): {names} ({total} domains)')
-")
-
-HAS_UDP=$(python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR')
-try:
-    from services_config import SERVICES
-except ImportError:
-    from services_default import SERVICES
-print(any(s.get('udp_proxy', {}).get('enabled') for s in SERVICES.values()))
-")
+FORWARD_RULES=$(setupinfo forward-rules)
+SERVICE_SUMMARY=$(setupinfo summary)
+HAS_UDP=$(setupinfo has-udp)
 
 echo "Configured: $SERVICE_SUMMARY"
 echo
@@ -113,6 +100,12 @@ ExecStart=/usr/bin/python3 $SCRIPT_DIR/dns-proxy.py $PI_IP
 Restart=always
 RestartSec=5
 User=root
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -134,6 +127,13 @@ ExecStart=/usr/bin/python3 $SCRIPT_DIR/udp-proxy.py
 Restart=always
 RestartSec=5
 User=root
+LimitNOFILE=4096
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -150,8 +150,8 @@ else
 fi
 
 # ============================================================
-# Update sniproxy: disable its DNS, keep only TCP proxy
-# Rules generated dynamically from services config
+# Update sniproxy: TCP proxy plus its private localhost DNS helper
+# Rules generated dynamically from the active services config
 # ============================================================
 
 # Check for old sniproxy-discord service and migrate
@@ -182,11 +182,18 @@ ExecStart=/usr/local/bin/sniproxy \\
   --http-address=0.0.0.0 \\
   --http-port=80 \\
   --dns-address=127.0.0.1 \\
+  --dns-port=1053 \\
   --dns-redirect-ipv4-to=$PI_IP \\
   --forward-proxy=socks5://127.0.0.1:1080 \\
 $FORWARD_RULES
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

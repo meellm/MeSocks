@@ -6,6 +6,7 @@ services are routed through VPN.
 
 Each service needs:
   - "domains": list of base domains (subdomains are matched automatically)
+  - "enabled": optional bool (defaults to True)
   - "udp_proxy" (optional): for services that need UDP forwarding (e.g., Discord voice)
 
 To add a new service, just add a new entry to the SERVICES dict below.
@@ -15,6 +16,7 @@ To remove a service, delete or comment out its entry.
 SERVICES = {
     # ── Discord (voice + text + CDN) ──────────────────────────
     "discord": {
+        "enabled": True,
         "domains": [
             "discord.com",
             "discord.gg",
@@ -47,8 +49,8 @@ SERVICES = {
             "enabled": True,
             "port": 443,
             "media_patterns": [
-                r"^[a-z\-]+\d+\.discord\.gg$",
-                r"^[a-z\-]+\d+\.discord\.media$",
+                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.gg$",
+                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",
             ],
         },
     },

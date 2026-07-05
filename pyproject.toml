@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesocks"
+version = "0.2.0"
+description = "Transparent DNS/SNI/UDP proxy for routing selected services through a VPN-connected Raspberry Pi."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[project.scripts]
+mesocks-dns = "mesocks.dns_server:main"
+mesocks-udp = "mesocks.udp_proxy:main"
+mesocks-setupinfo = "mesocks.setupinfo:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = [
+    "--tb=short",
+]
