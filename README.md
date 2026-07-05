@@ -1,182 +1,220 @@
 # MeSocks
 
-**Transparent VPN proxy for restricted services on Raspberry Pi.**
+**Transparent VPN proxy for selected services on a Raspberry Pi.**
 
-Route Discord, Spotify, Netflix, and other blocked services through VPN — no app configuration needed. Just point your device's DNS to the Pi.
+MeSocks lets devices route configured services through a VPN-connected Pi
+without changing app-level proxy settings. Point a device's DNS server at the
+Pi, and MeSocks hijacks only the configured service domains, forwards HTTPS via
+SNI proxying, and forwards UDP media traffic when a profile needs it.
 
-## Features
+<p align="center">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-blue">
+  <img alt="platform" src="https://img.shields.io/badge/Raspberry%20Pi-supported-success">
+</p>
 
-- **Bypass blocks** — ISP, country, work/school networks
-- **Full voice support** — UDP proxying for Discord calls
-- **Any device** — Windows, Mac, Linux, iOS, Android, consoles
-- **Transparent** — no app changes, just set DNS
-- **Multi-service** — add any service via config file
-- **Runs on Raspberry Pi**
+---
+
+## Highlights
+
+- DNS hijack for selected service profiles only
+- Discord built in by default, including text/API/CDN and voice/media routing
+- Per-client UDP media routing so multiple clients can use different voice
+  servers without clobbering each other
+- Local SOCKS5 backend for `sniproxy`
+- Private-network gates and rate limits to avoid open resolver/relay behavior
+- Modular profiles for adding or disabling services without editing daemon code
+- Backward-compatible launchers for existing `dns-proxy.py` and `udp-proxy.py`
+  deployments
+
+---
 
 ## Architecture
 
+```text
+[Client device]
+    | DNS: service domain?
+    v
+[mesocks-dns :53] ---- resolve real IP ----> [Upstream DNS]
+    | returns Pi IP
+    | records media host -> real IP
+    v
+[mesocks-sniproxy :443/:80] ---- SOCKS5 ----> [VPN path] ----> Service TCP
+[mesocks-udp-proxy :443/udp] ---------------> [VPN path] ----> Service UDP media
 ```
-[Any Device] ──DNS──> [Pi on VPN Network] ──> [VPN Exit] ──> [Internet]
-                              │
-                    ┌─────────┴─────────┐
-                    │                   │
-               TCP :443            UDP :443
-               (sniproxy)        (udp-proxy)
-                    │                   │
-                    v                   v
-              Service APIs       Voice/Media
-```
 
-**How it works:**
-1. Device asks Pi for `discord.com` IP
-2. Pi returns its own IP (hijack)
-3. Device connects to Pi thinking it's the real server
-4. Pi forwards traffic through VPN to the real server
+The DNS server is the control plane: it decides which domains belong to active
+profiles and records real media server IPs for UDP. The TCP and UDP proxies are
+the data plane.
 
-## Quick Start
+---
 
-### Requirements
+## Install
 
-- Raspberry Pi connected to a VPN network
+Requirements:
+
+- Raspberry Pi or Linux host on the VPN network path
 - Python 3.10+
-
-### Installation
+- `microsocks` (installed by `setup.sh`)
+- `sniproxy` binary at `/usr/local/bin/sniproxy`
 
 ```bash
 git clone https://github.com/meellm/MeSocks.git
 cd MeSocks
 
-# TCP only (text, API, images)
+# SOCKS5 backend + WiFi priority helper
 sudo ./setup.sh
 
-# Full setup with voice/media support
+# DNS hijack + TCP proxy + UDP media proxy
 sudo ./setup-services.sh YOUR_PI_IP
+
+# Start the services
+sudo systemctl start mesocks-dns mesocks-sniproxy mesocks-udp-proxy
 ```
 
-### Configure Your Device
+For more operational detail, see [docs/Deployment.md](docs/Deployment.md).
 
-Point your device's DNS to your Pi's IP:
+---
 
-| Platform | How |
-|----------|-----|
-| **Windows** | Network settings > IPv4 > DNS: `[Pi IP]` |
-| **Mac** | System Preferences > Network > DNS |
-| **iOS** | WiFi > (i) > Configure DNS > Manual |
-| **Android** | WiFi > Modify > Advanced > DNS |
-| **Linux** | `/etc/resolv.conf` or NetworkManager |
+## Configure a Device
 
-That's it! Configured services now route through VPN.
+Set the device's DNS server to the Pi IP.
 
-## Adding Services
+| Platform | Where |
+|---|---|
+| Windows | Network settings -> IPv4 -> DNS |
+| macOS | System Settings -> Network -> DNS |
+| iOS | Wi-Fi -> info button -> Configure DNS -> Manual |
+| Android | Wi-Fi -> Modify network -> Advanced -> DNS |
+| Linux | NetworkManager or `/etc/resolv.conf` |
 
-Copy the example config and edit it:
+No browser extension or app proxy setting is needed.
+
+---
+
+## Service Profiles
+
+If no local config exists, MeSocks uses the built-in `discord` profile. To
+customize services:
 
 ```bash
 cp services_config.example.py services_config.py
-nano services_config.py
 ```
 
-Each service is a dict entry with a list of domains:
+Each profile is a plain dictionary:
 
 ```python
 SERVICES = {
     "discord": {
-        "domains": ["discord.com", "discord.gg", "discordapp.com", ...],
-        "udp_proxy": {  # Optional: only for services needing UDP
+        "enabled": True,
+        "domains": ["discord.com", "discord.gg", "discord.media"],
+        "udp_proxy": {
             "enabled": True,
             "port": 443,
-            "media_patterns": [r"^[a-z\-]+\d+\.discord\.gg$"],
+            "media_patterns": [
+                r"^[a-z0-9\-]+\d+[a-z0-9\-]*\.discord\.media$",
+            ],
         },
-    },
-    "spotify": {
-        "domains": ["spotify.com", "scdn.co", "spotifycdn.com"],
-    },
-    "netflix": {
-        "domains": ["netflix.com", "nflxvideo.net", "nflximg.net"],
     },
 }
 ```
 
-After editing, re-run setup to apply:
+Subdomains match automatically. UDP media patterns are tracked per client so
+voice traffic is forwarded to the server that client actually resolved.
+
+See [docs/Profiles.md](docs/Profiles.md) for profile fields and examples.
+
+---
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `sudo ./setup.sh` | Install/start local `microsocks` backend |
+| `sudo ./setup-services.sh YOUR_PI_IP` | Write systemd units from active profiles |
+| `sudo systemctl restart mesocks-dns mesocks-sniproxy mesocks-udp-proxy` | Restart after config/code changes |
+| `journalctl -u mesocks-dns -f` | Watch DNS hijack and media tracking logs |
+| `journalctl -u mesocks-udp-proxy -f` | Watch UDP voice/media sessions |
+| `PYTHONPATH=src python -m mesocks.setupinfo summary` | Show active profile summary |
+
+The installable package also exposes `mesocks-dns`, `mesocks-udp`, and
+`mesocks-setupinfo` entry points for development installs.
+
+---
+
+## Project Layout
+
+| Path | Purpose |
+|---|---|
+| `src/mesocks/settings.py` | Runtime tunables and `config_local.py` overrides |
+| `src/mesocks/profiles.py` | Built-in profiles and service matching |
+| `src/mesocks/dnspacket.py` | DNS wire-format parsing/building |
+| `src/mesocks/cache.py` | Forward DNS cache and media IP tracker |
+| `src/mesocks/ratelimit.py` | Private-network checks and per-IP rate limits |
+| `src/mesocks/dns_server.py` | DNS hijack daemon |
+| `src/mesocks/udp_proxy.py` | UDP media proxy daemon |
+| `dns-proxy.py`, `udp-proxy.py` | Compatibility launchers |
+| `tests/` | Unit tests |
+| `docs/` | Deployment and profile guides |
+
+---
+
+## Development
 
 ```bash
-sudo ./setup-services.sh YOUR_PI_IP
-sudo systemctl restart mesocks-dns mesocks-sniproxy
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+pytest
+bash -n setup.sh setup-services.sh
 ```
 
-If you don't create `services_config.py`, the default Discord-only config is used automatically.
+The runtime package has no third-party Python dependencies. Development uses
+`pytest`.
 
-## Services
-
-| Service | Port | Purpose |
-|---------|------|---------|
-| `mesocks-dns` | UDP 53 | DNS hijack + IP caching |
-| `mesocks-udp-proxy` | UDP 443 | Voice/media traffic forwarding |
-| `mesocks-sniproxy` | TCP 443/80 | HTTPS/HTTP forwarding |
-| `socks-proxy` | TCP 1080 | SOCKS5 backend |
-
-### Commands
-
-```bash
-# Check status
-sudo systemctl status mesocks-dns
-sudo systemctl status mesocks-udp-proxy
-
-# View logs
-journalctl -u mesocks-dns -f
-
-# Restart all
-sudo systemctl restart mesocks-dns mesocks-sniproxy mesocks-udp-proxy
-```
-
-## Components
-
-| File | Purpose |
-|------|---------|
-| `dns-proxy.py` | DNS server — hijacks domains, caches real IPs |
-| `udp-proxy.py` | UDP proxy — forwards voice/media traffic |
-| `setup.sh` | Basic setup (TCP only) |
-| `setup-services.sh` | Full setup with voice/media support |
-| `services_default.py` | Built-in Discord config (fallback) |
-| `services_config.example.py` | Example config with Spotify/Netflix/YouTube |
-
-### External Dependencies
-
-- **[sniproxy](https://github.com/ameshkov/sniproxy)** — SNI-based TCP proxy
-- **[microsocks](https://github.com/rofl0r/microsocks)** — Lightweight SOCKS5 server
+---
 
 ## Troubleshooting
 
-**Text works, voice doesn't:**
+**Text works but voice does not**
+
 ```bash
 sudo systemctl status mesocks-udp-proxy
+journalctl -u mesocks-dns -f
 cat /tmp/mesocks-media-ips.json
 ```
 
-**DNS not resolving:**
+Join a voice channel and check whether a `discord.media` or `discord.gg` media
+hostname appears in the DNS logs and cache file.
+
+**DNS does not resolve through the Pi**
+
 ```bash
 nslookup discord.com YOUR_PI_IP
+sudo systemctl status mesocks-dns
 ```
 
-**Can't reach service at all:**
-```bash
-# Check if Pi can reach the service through VPN
-curl -I https://discord.com
-```
+**TCP proxy does not start**
 
-## File Locations
+Check that `/usr/local/bin/sniproxy` exists and that `socks-proxy` is listening
+on `127.0.0.1:1080`.
 
-| File | Location |
-|------|----------|
-| Media IP cache | `/tmp/mesocks-media-ips.json` |
-| Services | `/etc/systemd/system/mesocks-*.service` |
-| sniproxy | `/usr/local/bin/sniproxy` |
-| User config | `services_config.py` (create from example) |
+---
+
+## Known Limitations
+
+- MeSocks only catches traffic that goes through DNS. A service using raw IP
+  literals can bypass it.
+- The UDP proxy has one listen port per deployment. Services with different UDP
+  ports may need separate instances.
+- Discord and other services can add domains over time. Keep profiles updated
+  when logs show service-owned domains outside the active profile.
+- Hijacking broad third-party domains can route unrelated traffic through the
+  VPN, so profiles should stay conservative.
+
+---
 
 ## License
 
 MIT
-
----
-
-Built for bypassing unfair restrictions.
